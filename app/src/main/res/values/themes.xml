@@ -1,0 +1,9 @@
+<resources>
+    <style name="Theme.Cam2Vault" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/cam2vault_primary</item>
+        <item name="android:statusBarColor">@color/cam2vault_background</item>
+        <item name="android:navigationBarColor">@color/cam2vault_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

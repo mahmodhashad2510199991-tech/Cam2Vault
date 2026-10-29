@@ -1,0 +1,5 @@
+<resources>
+    <color name="cam2vault_primary">#2457C5</color>
+    <color name="cam2vault_on_primary">#FFFFFF</color>
+    <color name="cam2vault_background">#101318</color>
+</resources>
