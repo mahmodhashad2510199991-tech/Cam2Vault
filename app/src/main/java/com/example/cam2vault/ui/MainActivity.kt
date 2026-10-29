@@ -28,7 +28,7 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
 
     private lateinit var camera2Manager: Camera2Manager
-    private var recordingService: VideoRecordingService? = null
+    private var recordingService by mutableStateOf<VideoRecordingService?>(null)
     private var isBound = false
 
     private val serviceConnection = object : ServiceConnection {

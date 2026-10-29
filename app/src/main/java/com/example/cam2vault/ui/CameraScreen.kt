@@ -1,7 +1,7 @@
 package com.example.cam2vault.ui
 
 import android.graphics.SurfaceTexture
-import android.view.Surface
+import android.view.Surface as AndroidSurface
 import android.view.TextureView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -24,7 +24,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.example.cam2vault.camera.Camera2Manager
 import com.example.cam2vault.data.VideoConfig
 import com.example.cam2vault.service.VideoRecordingService
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -50,12 +50,14 @@ fun CameraScreen(
         ))
     }
 
-    var previewSurface by remember { mutableStateOf<Surface?>(null) }
+    var previewSurface by remember { mutableStateOf<AndroidSurface?>(null) }
     var showConfigDialog by remember { mutableStateOf(false) }
 
     val service = getService()
-    val recordingState by (service?.recordingState?.collectAsState()
-        ?: remember { mutableStateOf(VideoRecordingService.RecordingState()) })
+    val stateFlow = remember(service) {
+        service?.recordingState ?: MutableStateFlow(VideoRecordingService.RecordingState())
+    }
+    val recordingState by stateFlow.collectAsState()
 
     LaunchedEffect(cameraId) {
         try {
@@ -73,7 +75,7 @@ fun CameraScreen(
                 TextureView(ctx).apply {
                     surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                         override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
-                            previewSurface = Surface(st)
+                            previewSurface = AndroidSurface(st)
                         }
                         override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
                         override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {

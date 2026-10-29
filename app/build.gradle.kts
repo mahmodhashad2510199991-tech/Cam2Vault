@@ -51,6 +51,7 @@ dependencies {
     implementation(libs.androidx.material3)
     implementation(libs.androidx.material.icons.extended)
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.core.ktx)
 
     // Lifecycle & Service
     implementation(libs.androidx.lifecycle.runtime.ktx)

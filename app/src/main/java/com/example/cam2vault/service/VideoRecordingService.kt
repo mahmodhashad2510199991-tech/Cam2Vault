@@ -23,6 +23,7 @@ import android.util.Log
 import android.util.Size
 import android.view.Surface
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.example.cam2vault.R
 import com.example.cam2vault.camera.Camera2Manager
 import com.example.cam2vault.data.VideoConfig
@@ -70,7 +71,6 @@ class VideoRecordingService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        acquireWakeLock()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -97,12 +97,17 @@ class VideoRecordingService : Service() {
             currentFileDescriptor = pfd
 
             // 2. Initialize MediaRecorder with HEVC
-            mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            acquireWakeLock()
+            ContextCompat.startForegroundService(this, Intent(this, VideoRecordingService::class.java))
+
+            val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 MediaRecorder(this)
             } else {
                 @Suppress("DEPRECATION")
                 MediaRecorder()
-            }.apply {
+            }
+            mediaRecorder = recorder
+            recorder.apply {
                 setAudioSource(MediaRecorder.AudioSource.MIC)
                 setVideoSource(MediaRecorder.VideoSource.SURFACE)
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
@@ -266,6 +271,7 @@ class VideoRecordingService : Service() {
     }
 
     private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
