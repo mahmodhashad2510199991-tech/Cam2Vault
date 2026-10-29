@@ -15,7 +15,7 @@ import android.view.Surface
 import com.example.cam2vault.data.VideoConfig
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlin.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
  * Manages Camera2 hardware queries, StreamConfigurationMap checks,
