@@ -1,6 +1,7 @@
 package com.example.cam2vault.ui
 
 import android.graphics.SurfaceTexture
+import android.widget.Toast
 import android.view.Surface as AndroidSurface
 import android.view.TextureView
 import androidx.compose.foundation.background
@@ -24,6 +25,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.example.cam2vault.camera.Camera2Manager
 import com.example.cam2vault.data.VideoConfig
 import com.example.cam2vault.service.VideoRecordingService
+import com.example.cam2vault.service.VolumeKeyController
 import kotlinx.coroutines.flow.MutableStateFlow
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -58,6 +60,30 @@ fun CameraScreen(
         service?.recordingState ?: MutableStateFlow(VideoRecordingService.RecordingState())
     }
     val recordingState by stateFlow.collectAsState()
+
+    // Single toggle used by both the on-screen button and the volume buttons
+    val toggleRecording = rememberUpdatedState<() -> Unit> {
+        val activeService = getService()
+        if (activeService != null) {
+            if (activeService.recordingState.value.isRecording) {
+                activeService.stopRecording()
+            } else {
+                val ok = activeService.startRecording(
+                    config = selectedConfig,
+                    cameraManager = camera2Manager,
+                    cameraId = cameraId,
+                    previewSurface = previewSurface
+                )
+                if (!ok) {
+                    Toast.makeText(context, "فشل بدء التسجيل - جرّب إعداداً آخر", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+    DisposableEffect(Unit) {
+        VolumeKeyController.onVolumeKey = { toggleRecording.value() }
+        onDispose { VolumeKeyController.onVolumeKey = null }
+    }
 
     LaunchedEffect(cameraId) {
         try {
@@ -218,19 +244,7 @@ fun CameraScreen(
                     .size(80.dp)
                     .clip(CircleShape)
                     .border(4.dp, Color.White, CircleShape)
-                    .clickable {
-                        val activeService = getService() ?: return@clickable
-                        if (recordingState.isRecording) {
-                            activeService.stopRecording()
-                        } else {
-                            activeService.startRecording(
-                                config = selectedConfig,
-                                cameraManager = camera2Manager,
-                                cameraId = cameraId,
-                                previewSurface = previewSurface
-                            )
-                        }
-                    },
+                    .clickable { toggleRecording.value() },
                 contentAlignment = Alignment.Center
             ) {
                 Box(

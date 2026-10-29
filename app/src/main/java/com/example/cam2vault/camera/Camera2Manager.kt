@@ -5,6 +5,8 @@ import android.content.Context
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.CamcorderProfile
+import android.media.MediaCodecList
 import android.media.MediaRecorder
 import android.os.Handler
 import android.os.HandlerThread
@@ -103,17 +105,21 @@ class Camera2Manager(private val context: Context) {
                     )
                 )
 
-                // 60 FPS HEVC: verify if sensor supports 60fps for this size
-                val is60SupportedForSize = if (size.width >= 3840) {
-                    // For 4K at 60fps, ensure AE ranges allow [60, 60] or high-speed config lists 4K
-                    fpsRanges.any { it.lower >= 30 && it.upper >= 60 } ||
-                            highSpeedSizes.any { it.width == size.width && it.height == size.height }
-                } else {
-                    supports60FpsGlobally || supportsHighSpeed60
-                }
+                // 60 FPS HEVC: verified per size using real hardware limits
+                val minDurationNs = try {
+                    map.getOutputMinFrameDuration(MediaRecorder::class.java, size)
+                } catch (e: Exception) { 0L }
+                val sizeMaxFps = if (minDurationNs > 0) (1_000_000_000.0 / minDurationNs).toInt() else 0
+                val profileFps = profileFrameRate(cameraId, size)
+                val encoderOk = hevcEncoderSupports(size.width, size.height, 60)
+                Log.d(TAG, "${size.width}x${size.height}: sizeMaxFps=$sizeMaxFps profileFps=$profileFps encoder60=$encoderOk")
 
-                if (is60SupportedForSize) {
-                    val bitrate60 = calculateHevcBitrate(size.width, size.height, 60)
+                val verified60 = sizeMaxFps >= 59 || profileFps >= 59 ||
+                        (size.width < 3840 && (supports60FpsGlobally || supportsHighSpeed60)) ||
+                        (size.width >= 3840 && highSpeedSizes.any { it.width == size.width && it.height == size.height })
+
+                val bitrate60 = calculateHevcBitrate(size.width, size.height, 60)
+                if (verified60 && (encoderOk || size.width < 3840)) {
                     supportedConfigs.add(
                         VideoConfig(
                             id = "${size.width}x${size.height}_60",
@@ -122,7 +128,20 @@ class Camera2Manager(private val context: Context) {
                             bitrate = bitrate60,
                             label = label,
                             codec = "HEVC (H.265)",
-                            isHighSpeed = size.width >= 3840 && !fpsRanges.any { it.upper >= 60 }
+                            isHighSpeed = false
+                        )
+                    )
+                } else if (size.width >= 3840) {
+                    // Not reported by the camera HAL: offer as experimental so it can be tried
+                    supportedConfigs.add(
+                        VideoConfig(
+                            id = "${size.width}x${size.height}_60",
+                            resolution = size,
+                            fps = 60,
+                            bitrate = bitrate60,
+                            label = "$label (تجريبي)",
+                            codec = "HEVC (H.265)",
+                            isHighSpeed = false
                         )
                     )
                 }
@@ -130,6 +149,34 @@ class Camera2Manager(private val context: Context) {
         }
 
         return supportedConfigs
+    }
+
+    private fun profileFrameRate(cameraId: String, size: Size): Int {
+        return try {
+            val id = cameraId.toInt()
+            val quality = when {
+                size.width >= 3840 -> CamcorderProfile.QUALITY_2160P
+                size.width >= 1920 -> CamcorderProfile.QUALITY_1080P
+                else -> CamcorderProfile.QUALITY_720P
+            }
+            if (CamcorderProfile.hasProfile(id, quality)) {
+                CamcorderProfile.get(id, quality)?.videoFrameRate ?: 0
+            } else 0
+        } catch (e: Exception) {
+            0
+        }
+    }
+
+    private fun hevcEncoderSupports(width: Int, height: Int, fps: Int): Boolean {
+        return try {
+            MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { info ->
+                info.isEncoder && info.supportedTypes.any { it.equals("video/hevc", ignoreCase = true) } &&
+                        info.getCapabilitiesForType("video/hevc").videoCapabilities
+                            .areSizeAndRateSupported(width, height, fps.toDouble())
+            }
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /**
@@ -205,7 +252,12 @@ class Camera2Manager(private val context: Context) {
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
 
                         // Enforce exact FPS target range (e.g. [60, 60] or [30, 30])
-                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(config.fps, config.fps))
+                        val aeRanges = cameraManager.getCameraCharacteristics(cameraId)
+                            .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
+                        val chosenRange = aeRanges.firstOrNull { it.lower == config.fps && it.upper == config.fps }
+                            ?: aeRanges.filter { it.upper == config.fps }.maxByOrNull { it.lower }
+                            ?: Range(config.fps, config.fps)
+                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, chosenRange)
 
                         // Enable optical video stabilization if hardware supports it
                         val characteristics = cameraManager.getCameraCharacteristics(cameraId)

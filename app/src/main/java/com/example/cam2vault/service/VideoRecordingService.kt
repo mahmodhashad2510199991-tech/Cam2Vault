@@ -11,6 +11,9 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.hardware.camera2.*
 import android.media.MediaRecorder
+import android.media.VolumeProvider
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
@@ -50,6 +53,7 @@ class VideoRecordingService : Service() {
 
     private var recordingStartTime = 0L
     private var timerJob: Job? = null
+    private var mediaSession: MediaSession? = null
 
     private val _recordingState = MutableStateFlow(RecordingState())
     val recordingState = _recordingState.asStateFlow()
@@ -152,13 +156,20 @@ class VideoRecordingService : Service() {
                 currentFileName = uri.lastPathSegment
             )
 
+            activateMediaSession()
             startTimer(config)
             Log.i(TAG, "Recording started successfully: ${config.label} HEVC at ${config.fps}fps")
             return true
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start recording: ${e.message}", e)
+            try { mediaRecorder?.release() } catch (_: Exception) {}
+            mediaRecorder = null
+            try { currentFileDescriptor?.close() } catch (_: Exception) {}
+            currentVideoUri?.let { try { contentResolver.delete(it, null, null) } catch (_: Exception) {} }
+            currentVideoUri = null
             cleanupRecording()
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
             return false
         }
     }
@@ -291,8 +302,43 @@ class VideoRecordingService : Service() {
         wakeLock = null
     }
 
+    /**
+     * Routes the hardware volume buttons to this app while recording, even with the screen off.
+     */
+    private fun activateMediaSession() {
+        try {
+            releaseMediaSession()
+            val session = MediaSession(this, "Cam2VaultVolumeControl")
+            session.setPlaybackState(
+                PlaybackState.Builder()
+                    .setActions(PlaybackState.ACTION_PLAY_PAUSE)
+                    .setState(PlaybackState.STATE_PLAYING, 0L, 1f)
+                    .build()
+            )
+            session.setPlaybackToRemote(object : VolumeProvider(VOLUME_CONTROL_RELATIVE, 100, 50) {
+                override fun onAdjustVolume(direction: Int) {
+                    if (direction != 0) VolumeKeyController.trigger()
+                }
+            })
+            session.isActive = true
+            mediaSession = session
+        } catch (e: Exception) {
+            Log.e(TAG, "MediaSession setup failed: ${e.message}", e)
+        }
+    }
+
+    private fun releaseMediaSession() {
+        try {
+            mediaSession?.isActive = false
+            mediaSession?.release()
+        } catch (_: Exception) {
+        }
+        mediaSession = null
+    }
+
     private fun cleanupRecording() {
         currentFileDescriptor = null
+        releaseMediaSession()
         releaseWakeLock()
     }
 
