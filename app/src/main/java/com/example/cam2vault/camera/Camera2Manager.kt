@@ -283,6 +283,16 @@ class Camera2Manager(private val context: Context) {
         }, backgroundHandler)
     }
 
+    fun stopCaptureSession() {
+        try {
+            captureSession?.stopRepeating()
+            captureSession?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping capture session", e)
+        }
+        captureSession = null
+    }
+
     fun getSensorOrientation(cameraId: String): Int {
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         return characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90

@@ -1,7 +1,13 @@
 package com.example.cam2vault.ui
 
 import android.graphics.SurfaceTexture
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings as AndroidSettings
 import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import android.view.Surface as AndroidSurface
 import android.view.TextureView
 import androidx.compose.foundation.background
@@ -43,7 +49,11 @@ fun CameraScreen(
     }
 
     var selectedConfig by remember {
-        mutableStateOf(supportedConfigs.firstOrNull() ?: VideoConfig(
+        mutableStateOf(
+            supportedConfigs.firstOrNull { it.fps == 60 && it.resolution.width >= 3840 }
+                ?: supportedConfigs.firstOrNull { it.fps == 60 }
+                ?: supportedConfigs.firstOrNull()
+                ?: VideoConfig(
             id = "default",
             resolution = android.util.Size(1920, 1080),
             fps = 30,
@@ -52,7 +62,18 @@ fun CameraScreen(
         ))
     }
 
-    var previewSurface by remember { mutableStateOf<AndroidSurface?>(null) }
+    var orientationMode by remember { mutableIntStateOf(1) } // 0 portrait, 1 landscape, 2 landscape flipped
+    var canOverlay by remember { mutableStateOf(AndroidSettings.canDrawOverlays(context)) }
+    DisposableEffect(Unit) {
+        val lifecycle = (context as? ComponentActivity)?.lifecycle
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                canOverlay = AndroidSettings.canDrawOverlays(context)
+            }
+        }
+        lifecycle?.addObserver(observer)
+        onDispose { lifecycle?.removeObserver(observer) }
+    }
     var showConfigDialog by remember { mutableStateOf(false) }
 
     val service = getService()
@@ -72,7 +93,8 @@ fun CameraScreen(
                     config = selectedConfig,
                     cameraManager = camera2Manager,
                     cameraId = cameraId,
-                    previewSurface = previewSurface
+                    previewSurface = null,
+                    orientationMode = orientationMode
                 )
                 if (!ok) {
                     Toast.makeText(context, "فشل بدء التسجيل - جرّب إعداداً آخر", Toast.LENGTH_LONG).show()
@@ -94,27 +116,6 @@ fun CameraScreen(
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        // 1. Live Camera TextureView Preview
-        AndroidView(
-            modifier = Modifier.fillMaxSize(),
-            factory = { ctx ->
-                TextureView(ctx).apply {
-                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                        override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
-                            previewSurface = AndroidSurface(st)
-                        }
-                        override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
-                        override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-                            previewSurface?.release()
-                            previewSurface = null
-                            return true
-                        }
-                        override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
-                    }
-                }
-            }
-        )
-
         // 2. Top Header Overlay (Config badge, HEVC indicator, Lockscreen reminder)
         Column(
             modifier = Modifier
@@ -166,6 +167,52 @@ fun CameraScreen(
                         fontSize = 11.sp,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                     )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color.Black.copy(alpha = 0.65f),
+                    modifier = Modifier.clickable(enabled = !recordingState.isRecording) {
+                        orientationMode = (orientationMode + 1) % 3
+                    }
+                ) {
+                    Text(
+                        text = when (orientationMode) {
+                            1 -> "عرضي 16:9"
+                            2 -> "عرضي مقلوب 16:9"
+                            else -> "طولي 9:16"
+                        },
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                    )
+                }
+                if (!canOverlay) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color(0xFFB45309),
+                        modifier = Modifier.clickable {
+                            context.startActivity(
+                                Intent(
+                                    AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                            )
+                        }
+                    ) {
+                        Text(
+                            text = "فعّل المعاينة العائمة",
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
+                    }
                 }
             }
 

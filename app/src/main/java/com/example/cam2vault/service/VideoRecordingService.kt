@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.hardware.camera2.*
 import android.media.MediaRecorder
+import android.provider.Settings
 import android.media.VolumeProvider
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
@@ -54,6 +55,8 @@ class VideoRecordingService : Service() {
     private var recordingStartTime = 0L
     private var timerJob: Job? = null
     private var mediaSession: MediaSession? = null
+    private var floatingPreview: FloatingPreview? = null
+    private var activeCamera: Camera2Manager? = null
 
     private val _recordingState = MutableStateFlow(RecordingState())
     val recordingState = _recordingState.asStateFlow()
@@ -92,7 +95,8 @@ class VideoRecordingService : Service() {
         config: VideoConfig,
         cameraManager: Camera2Manager,
         cameraId: String,
-        previewSurface: Surface?
+        previewSurface: Surface?,
+        orientationMode: Int = 0
     ): Boolean {
         try {
             // 1. Setup MediaStore output file
@@ -131,7 +135,12 @@ class VideoRecordingService : Service() {
 
                 // Orientation hint from camera sensor
                 val sensorOrientation = cameraManager.getSensorOrientation(cameraId)
-                setOrientationHint(sensorOrientation)
+                val orientationHint = when (orientationMode) {
+                    1 -> (sensorOrientation + 270) % 360
+                    2 -> (sensorOrientation + 90) % 360
+                    else -> sensorOrientation
+                }
+                setOrientationHint(orientationHint)
 
                 setOutputFile(pfd.fileDescriptor)
                 prepare()
@@ -146,7 +155,18 @@ class VideoRecordingService : Service() {
 
             // 5. Connect Camera2 Capture Session with MediaRecorder Surface
             val recorderSurface = mediaRecorder!!.surface
-            cameraManager.startRecordingCaptureSession(cameraId, config, recorderSurface, previewSurface)
+            activeCamera = cameraManager
+            if (Settings.canDrawOverlays(this)) {
+                val preview = FloatingPreview(this)
+                floatingPreview = preview
+                preview.show { surf ->
+                    if (mediaRecorder != null) {
+                        cameraManager.startRecordingCaptureSession(cameraId, config, recorderSurface, surf)
+                    }
+                }
+            } else {
+                cameraManager.startRecordingCaptureSession(cameraId, config, recorderSurface, null)
+            }
 
             _recordingState.value = RecordingState(
                 isRecording = true,
@@ -163,6 +183,8 @@ class VideoRecordingService : Service() {
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start recording: ${e.message}", e)
+            try { activeCamera?.stopCaptureSession() } catch (_: Exception) {}
+            activeCamera = null
             try { mediaRecorder?.release() } catch (_: Exception) {}
             mediaRecorder = null
             try { currentFileDescriptor?.close() } catch (_: Exception) {}
@@ -182,6 +204,8 @@ class VideoRecordingService : Service() {
         if (!_recordingState.value.isRecording) return
 
         timerJob?.cancel()
+        activeCamera?.stopCaptureSession()
+        activeCamera = null
         try {
             mediaRecorder?.apply {
                 stop()
@@ -338,6 +362,8 @@ class VideoRecordingService : Service() {
 
     private fun cleanupRecording() {
         currentFileDescriptor = null
+        floatingPreview?.hide()
+        floatingPreview = null
         releaseMediaSession()
         releaseWakeLock()
     }
