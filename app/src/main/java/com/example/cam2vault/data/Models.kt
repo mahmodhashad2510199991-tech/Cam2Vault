@@ -4,7 +4,10 @@ import android.net.Uri
 import android.util.Size
 
 /**
- * Represents a hardware-validated video recording configuration.
+ * Hardware-validated recording configuration.
+ *
+ * [fpsMin]..[fps] is the exact AE target range that gets sent to the camera
+ * (for constrained high-speed sessions it must be one of the ranges the camera reports).
  */
 data class VideoConfig(
     val id: String,
@@ -12,8 +15,10 @@ data class VideoConfig(
     val fps: Int,
     val bitrate: Int,
     val label: String,
-    val codec: String = "HEVC (H.265)",
-    val isHighSpeed: Boolean = false
+    val useHevc: Boolean = true,
+    val isHighSpeed: Boolean = false,
+    val fpsMin: Int = fps,
+    val withAudio: Boolean = true
 ) {
     val resolutionString: String
         get() = "${resolution.width}x${resolution.height}"
@@ -21,9 +26,21 @@ data class VideoConfig(
     val formattedBitrate: String
         get() = "${bitrate / 1_000_000} Mbps"
 
+    val codecName: String
+        get() = if (useHevc) "HEVC" else "H.264"
+
     val is4K: Boolean
         get() = resolution.width >= 3840
 }
+
+/**
+ * The only two modes the app offers.
+ * [slowMo] is null when the phone does not expose high-speed recording to apps.
+ */
+data class RecordingModes(
+    val uhd60: VideoConfig,
+    val slowMo: VideoConfig?
+)
 
 /**
  * Video item query result from MediaStore.Video.Media

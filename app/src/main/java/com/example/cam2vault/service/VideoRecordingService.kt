@@ -9,9 +9,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.hardware.camera2.*
 import android.media.MediaRecorder
-import android.provider.Settings
 import android.media.VolumeProvider
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
@@ -23,29 +21,43 @@ import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Log
-import android.util.Size
 import android.view.Surface
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import com.example.cam2vault.R
 import com.example.cam2vault.camera.Camera2Manager
 import com.example.cam2vault.data.VideoConfig
 import com.example.cam2vault.ui.MainActivity
-import kotlinx.coroutines.*
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Date
+import java.util.Locale
 
 /**
- * Foreground Service running camera & microphone types.
- * Keeps recording continuously with WakeLock even when the phone screen turns off.
+ * Foreground service (camera + microphone).
+ *
+ * The service owns the camera, the MediaRecorder and the preview for the whole recording, so the
+ * recording keeps going even if the Activity is closed or destroyed.
  */
 class VideoRecordingService : Service() {
 
     private val binder = LocalBinder()
-    private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
+    private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var mediaRecorder: MediaRecorder? = null
@@ -54,6 +66,7 @@ class VideoRecordingService : Service() {
 
     private var recordingStartTime = 0L
     private var timerJob: Job? = null
+    private var startJob: Job? = null
     private var mediaSession: MediaSession? = null
     private var floatingPreview: FloatingPreview? = null
     private var activeCamera: Camera2Manager? = null
@@ -63,6 +76,7 @@ class VideoRecordingService : Service() {
 
     data class RecordingState(
         val isRecording: Boolean = false,
+        val isStarting: Boolean = false,
         val elapsedMs: Long = 0L,
         val activeConfig: VideoConfig? = null,
         val savedUri: Uri? = null,
@@ -87,136 +101,235 @@ class VideoRecordingService : Service() {
         return START_NOT_STICKY
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Start
+    // ---------------------------------------------------------------------------------------------
+
     /**
-     * Initializes MediaRecorder for HEVC (H.265), prepares MediaStore row,
-     * promotes service to foreground, and binds camera surfaces.
+     * Starts recording asynchronously. [onResult] is called on the main thread:
+     * (true, null) when frames are flowing, (false, reason) when it failed.
      */
     fun startRecording(
         config: VideoConfig,
-        cameraManager: Camera2Manager,
         cameraId: String,
-        previewSurface: Surface?,
-        orientationMode: Int = 0
-    ): Boolean {
-        try {
-            // 1. Setup MediaStore output file
-            val (uri, pfd) = createMediaStoreVideoFile(config)
-            currentVideoUri = uri
-            currentFileDescriptor = pfd
+        orientationMode: Int,
+        onResult: (Boolean, String?) -> Unit
+    ) {
+        val state = _recordingState.value
+        if (state.isRecording || state.isStarting) {
+            onResult(false, "التسجيل شغال بالفعل")
+            return
+        }
+        _recordingState.value = RecordingState(isStarting = true, activeConfig = config)
 
-            // 2. Initialize MediaRecorder with HEVC
-            acquireWakeLock()
-            ContextCompat.startForegroundService(this, Intent(this, VideoRecordingService::class.java))
-
-            val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                MediaRecorder(this)
-            } else {
-                @Suppress("DEPRECATION")
-                MediaRecorder()
+        startJob = serviceScope.launch {
+            try {
+                doStart(config, cameraId, orientationMode)
+                onResult(true, null)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start recording: ${e.message}", e)
+                abortStart()
+                onResult(false, e.message ?: "فشل بدء التسجيل")
             }
-            mediaRecorder = recorder
+        }
+    }
+
+    private suspend fun doStart(config: VideoConfig, cameraId: String, orientationMode: Int) {
+        val cam = Camera2Manager(applicationContext)
+        activeCamera = cam
+
+        // 1. MediaStore output
+        val (uri, pfd) = createMediaStoreVideoFile(config)
+        currentVideoUri = uri
+        currentFileDescriptor = pfd
+
+        // 2. Keep CPU awake + foreground service (camera|microphone)
+        acquireWakeLock()
+        ContextCompat.startForegroundService(this, Intent(this, VideoRecordingService::class.java))
+        startServiceForeground(config)
+
+        // 3. MediaRecorder
+        val hint = orientationHint(cam.getSensorOrientation(cameraId), orientationMode)
+        val recorder = buildRecorder(config, hint, pfd)
+        mediaRecorder = recorder
+
+        // 4. Camera (owned by this service)
+        cam.openCamera(cameraId)
+        cam.onCameraLost = { stopRecording() }
+
+        // 5. Optional floating preview
+        var previewSurface: Surface? = null
+        if (Settings.canDrawOverlays(this)) {
+            val preview = FloatingPreview(this)
+            floatingPreview = preview
+            val bufferW = if (config.isHighSpeed) config.resolution.width else 1280
+            val bufferH = if (config.isHighSpeed) config.resolution.height else 720
+            previewSurface = withTimeoutOrNull(2500L) {
+                suspendCancellableCoroutine<Surface?> { c ->
+                    preview.show(bufferW, bufferH, hint) { s ->
+                        if (c.isActive) c.resume(s)
+                    }
+                }
+            }
+        }
+
+        // 6. Capture session (normal for 4K60, constrained high-speed for slow-mo)
+        val recorderSurface = recorder.surface
+        suspendCancellableCoroutine<Unit> { c ->
+            cam.startRecordingCaptureSession(
+                cameraId = cameraId,
+                config = config,
+                recorderSurface = recorderSurface,
+                previewSurface = previewSurface,
+                onReady = { if (c.isActive) c.resume(Unit) },
+                onError = { msg -> if (c.isActive) c.resumeWithException(RuntimeException(msg)) }
+            )
+        }
+
+        // 7. Frames are flowing: start the encoder
+        recorder.start()
+        recordingStartTime = SystemClock.elapsedRealtime()
+
+        _recordingState.value = RecordingState(
+            isRecording = true,
+            elapsedMs = 0L,
+            activeConfig = config,
+            savedUri = uri,
+            currentFileName = uri.lastPathSegment
+        )
+
+        activateMediaSession()
+        startTimer(config)
+        Log.i(TAG, "Recording started: ${config.label} ${config.codecName}")
+    }
+
+    private fun buildRecorder(config: VideoConfig, orientationHint: Int, pfd: ParcelFileDescriptor): MediaRecorder {
+        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            MediaRecorder(this)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaRecorder()
+        }
+        try {
             recorder.apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
+                if (config.withAudio) setAudioSource(MediaRecorder.AudioSource.MIC)
                 setVideoSource(MediaRecorder.VideoSource.SURFACE)
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
 
-                // HEVC (H.265) video encoder
-                setVideoEncoder(MediaRecorder.VideoEncoder.HEVC)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setVideoEncoder(
+                    if (config.useHevc) MediaRecorder.VideoEncoder.HEVC else MediaRecorder.VideoEncoder.H264
+                )
+                if (config.withAudio) setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
 
-                // Resolution and framerate
                 setVideoSize(config.resolution.width, config.resolution.height)
                 setVideoFrameRate(config.fps)
                 setVideoEncodingBitRate(config.bitrate)
 
-                // High quality audio
-                setAudioEncodingBitRate(192000)
-                setAudioSamplingRate(48000)
-
-                // Orientation hint from camera sensor
-                val sensorOrientation = cameraManager.getSensorOrientation(cameraId)
-                val orientationHint = when (orientationMode) {
-                    1 -> (sensorOrientation + 270) % 360
-                    2 -> (sensorOrientation + 90) % 360
-                    else -> sensorOrientation
+                if (config.withAudio) {
+                    setAudioEncodingBitRate(192000)
+                    setAudioSamplingRate(48000)
                 }
-                setOrientationHint(orientationHint)
 
+                setOrientationHint(orientationHint)
                 setOutputFile(pfd.fileDescriptor)
                 prepare()
             }
-
-            // 3. Promote to Foreground Service before starting recording (Android 14 requirements)
-            startServiceForeground(config)
-
-            // 4. Start MediaRecorder
-            mediaRecorder?.start()
-            recordingStartTime = SystemClock.elapsedRealtime()
-
-            // 5. Connect Camera2 Capture Session with MediaRecorder Surface
-            val recorderSurface = mediaRecorder!!.surface
-            activeCamera = cameraManager
-            if (Settings.canDrawOverlays(this)) {
-                val preview = FloatingPreview(this)
-                floatingPreview = preview
-                preview.show { surf ->
-                    if (mediaRecorder != null) {
-                        cameraManager.startRecordingCaptureSession(cameraId, config, recorderSurface, surf)
-                    }
-                }
-            } else {
-                cameraManager.startRecordingCaptureSession(cameraId, config, recorderSurface, null)
-            }
-
-            _recordingState.value = RecordingState(
-                isRecording = true,
-                elapsedMs = 0L,
-                activeConfig = config,
-                savedUri = uri,
-                currentFileName = uri.lastPathSegment
-            )
-
-            activateMediaSession()
-            startTimer(config)
-            Log.i(TAG, "Recording started successfully: ${config.label} HEVC at ${config.fps}fps")
-            return true
-
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start recording: ${e.message}", e)
-            try { activeCamera?.stopCaptureSession() } catch (_: Exception) {}
-            activeCamera = null
-            try { mediaRecorder?.release() } catch (_: Exception) {}
-            mediaRecorder = null
-            try { currentFileDescriptor?.close() } catch (_: Exception) {}
-            currentVideoUri?.let { try { contentResolver.delete(it, null, null) } catch (_: Exception) {} }
-            currentVideoUri = null
-            cleanupRecording()
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
-            return false
+            try {
+                recorder.release()
+            } catch (_: Exception) {
+            }
+            throw e
         }
+        return recorder
+    }
+
+    private fun orientationHint(sensorOrientation: Int, orientationMode: Int): Int =
+        when (orientationMode) {
+            1 -> (sensorOrientation + 270) % 360
+            2 -> (sensorOrientation + 90) % 360
+            else -> sensorOrientation
+        }
+
+    // ---------------------------------------------------------------------------------------------
+    // Stop / cleanup
+    // ---------------------------------------------------------------------------------------------
+
+    /** Start failed or was cancelled: release everything and delete the half-written file. */
+    private fun abortStart() {
+        timerJob?.cancel()
+        activeCamera?.let {
+            it.onCameraLost = null
+            it.stopCaptureSession()
+            it.close()
+        }
+        activeCamera = null
+        try {
+            mediaRecorder?.release()
+        } catch (_: Exception) {
+        }
+        mediaRecorder = null
+        try {
+            currentFileDescriptor?.close()
+        } catch (_: Exception) {
+        }
+        currentVideoUri?.let {
+            try {
+                contentResolver.delete(it, null, null)
+            } catch (_: Exception) {
+            }
+        }
+        currentVideoUri = null
+        cleanupRecording()
+        _recordingState.value = RecordingState()
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (_: Exception) {
+        }
+        stopSelf()
     }
 
     /**
-     * Gracefully stops recording, releases Camera2, closes MediaRecorder,
-     * updates MediaStore IS_PENDING flag, and removes foreground state.
+     * Gracefully stops recording, releases the camera, closes MediaRecorder and finalizes the
+     * MediaStore entry (a recording that is too short to be valid is deleted instead of kept broken).
      */
     fun stopRecording() {
-        if (!_recordingState.value.isRecording) return
+        val state = _recordingState.value
+        if (!state.isRecording) {
+            if (state.isStarting) {
+                startJob?.cancel()
+                abortStart()
+            }
+            return
+        }
 
         timerJob?.cancel()
-        activeCamera?.stopCaptureSession()
-        activeCamera = null
-        try {
-            mediaRecorder?.apply {
-                stop()
-                reset()
-                release()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping MediaRecorder: ${e.message}", e)
-        } finally {
-            mediaRecorder = null
+
+        activeCamera?.let {
+            it.onCameraLost = null
+            it.stopCaptureSession()
         }
+
+        var stoppedCleanly = true
+        val recorder = mediaRecorder
+        try {
+            recorder?.stop()
+        } catch (e: Exception) {
+            stoppedCleanly = false
+            Log.e(TAG, "MediaRecorder.stop failed (recording too short?): ${e.message}")
+        }
+        try {
+            recorder?.reset()
+            recorder?.release()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing MediaRecorder: ${e.message}")
+        }
+        mediaRecorder = null
+
+        activeCamera?.close()
+        activeCamera = null
 
         try {
             currentFileDescriptor?.close()
@@ -224,20 +337,24 @@ class VideoRecordingService : Service() {
             Log.e(TAG, "Error closing file descriptor", e)
         }
 
-        // Finalize MediaStore entry: set IS_PENDING = 0
-        currentVideoUri?.let { uri ->
-            finalizeMediaStoreVideo(uri, SystemClock.elapsedRealtime() - recordingStartTime)
+        val uri = currentVideoUri
+        var savedUri: Uri? = null
+        if (uri != null) {
+            if (stoppedCleanly) {
+                finalizeMediaStoreVideo(uri, SystemClock.elapsedRealtime() - recordingStartTime)
+                savedUri = uri
+            } else {
+                try {
+                    contentResolver.delete(uri, null, null)
+                } catch (_: Exception) {
+                }
+            }
         }
 
-        val lastUri = currentVideoUri
         cleanupRecording()
+        currentVideoUri = null
 
-        _recordingState.value = RecordingState(
-            isRecording = false,
-            elapsedMs = 0L,
-            activeConfig = null,
-            savedUri = lastUri
-        )
+        _recordingState.value = RecordingState(savedUri = savedUri)
 
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -246,13 +363,12 @@ class VideoRecordingService : Service() {
     private fun startServiceForeground(config: VideoConfig) {
         val notification = buildRecordingNotification(config, 0L)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val fgsTypes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                // Android 14+ requires explicit camera | microphone foreground service types
+            val types = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             } else {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
             }
-            startForeground(NOTIFICATION_ID, notification, fgsTypes)
+            startForeground(NOTIFICATION_ID, notification, types)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
@@ -265,19 +381,21 @@ class VideoRecordingService : Service() {
                 val elapsed = SystemClock.elapsedRealtime() - recordingStartTime
                 _recordingState.value = _recordingState.value.copy(elapsedMs = elapsed)
 
-                // Update notification with live recording duration
                 val manager = getSystemService(NotificationManager::class.java)
                 manager.notify(NOTIFICATION_ID, buildRecordingNotification(config, elapsed))
             }
         }
     }
 
-    /**
-     * MediaStore insertion with IS_PENDING = 1 for scoped storage compliance.
-     */
+    // ---------------------------------------------------------------------------------------------
+    // MediaStore
+    // ---------------------------------------------------------------------------------------------
+
     private fun createMediaStoreVideoFile(config: VideoConfig): Pair<Uri, ParcelFileDescriptor> {
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val fileName = "VID_${timeStamp}_${config.resolution.width}x${config.resolution.height}_HEVC.mp4"
+        val prefix = if (config.isHighSpeed) "SLOMO" else "VID"
+        val fileName = "${prefix}_${timeStamp}_${config.resolution.width}x${config.resolution.height}" +
+                "_${config.fps}fps_${config.codecName.replace(".", "")}.mp4"
 
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
@@ -288,10 +406,10 @@ class VideoRecordingService : Service() {
         }
 
         val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-            ?: throw IllegalStateException("Failed to insert MediaStore record")
+            ?: throw IllegalStateException("مقدرتش أعمل ملف الفيديو")
 
         val pfd = contentResolver.openFileDescriptor(uri, "rw")
-            ?: throw IllegalStateException("Failed to open ParcelFileDescriptor for URI: $uri")
+            ?: throw IllegalStateException("مقدرتش أفتح ملف الفيديو للكتابة")
 
         return Pair(uri, pfd)
     }
@@ -305,6 +423,10 @@ class VideoRecordingService : Service() {
         Log.i(TAG, "MediaStore video finalized at $uri (Duration: ${durationMs}ms)")
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Wake lock / media session / notification
+    // ---------------------------------------------------------------------------------------------
+
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -313,22 +435,18 @@ class VideoRecordingService : Service() {
             "Cam2Vault:BackgroundVideoRecordingWakeLock"
         ).apply {
             setReferenceCounted(false)
-            acquire(24 * 60 * 60 * 1000L) // Safe 24hr timeout max
+            acquire(24 * 60 * 60 * 1000L)
         }
     }
 
     private fun releaseWakeLock() {
         wakeLock?.let {
-            if (it.isHeld) {
-                it.release()
-            }
+            if (it.isHeld) it.release()
         }
         wakeLock = null
     }
 
-    /**
-     * Routes the hardware volume buttons to this app while recording, even with the screen off.
-     */
+    /** Routes the hardware volume buttons to this app while recording, even with the screen off. */
     private fun activateMediaSession() {
         try {
             releaseMediaSession()
@@ -372,7 +490,7 @@ class VideoRecordingService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Camera2 HEVC Background Recording",
+                "Camera2 Background Recording",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Shows live recording status with screen off"
@@ -402,15 +520,16 @@ class VideoRecordingService : Service() {
         val seconds = (elapsedMs / 1000) % 60
         val minutes = (elapsedMs / (1000 * 60)) % 60
         val hours = (elapsedMs / (1000 * 60 * 60))
-        val timeFormatted = String.format("%02d:%02d:%02d", hours, minutes, seconds)
+        val timeFormatted = String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds)
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Recording HEVC Video • $timeFormatted")
-            .setContentText("${config.label} @ ${config.fps}fps (Screen-off enabled)")
+            .setContentTitle("بيسجّل • $timeFormatted")
+            .setContentText("${config.label} • ${config.codecName}")
             .setSmallIcon(android.R.drawable.presence_video_busy)
             .setContentIntent(openPendingIntent)
             .setOngoing(true)
-            .addAction(android.R.drawable.ic_media_pause, "Stop Recording", stopPendingIntent)
+            .setOnlyAlertOnce(true)
+            .addAction(android.R.drawable.ic_media_pause, "إيقاف التسجيل", stopPendingIntent)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .build()

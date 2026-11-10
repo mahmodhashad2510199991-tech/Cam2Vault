@@ -1,68 +1,75 @@
 package com.example.cam2vault.ui
 
-import android.graphics.SurfaceTexture
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings as AndroidSettings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import android.view.Surface as AndroidSurface
-import android.view.TextureView
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.example.cam2vault.camera.Camera2Manager
-import com.example.cam2vault.data.VideoConfig
 import com.example.cam2vault.service.VideoRecordingService
 import com.example.cam2vault.service.VolumeKeyController
 import kotlinx.coroutines.flow.MutableStateFlow
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CameraScreen(
     camera2Manager: Camera2Manager,
     getService: () -> VideoRecordingService?
 ) {
-    val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
 
     val cameraId = remember { camera2Manager.getBackCameraId() }
-    val supportedConfigs = remember(cameraId) {
-        camera2Manager.querySupportedVideoConfigurations(cameraId)
-    }
+    val modes = remember(cameraId) { camera2Manager.queryModes(cameraId) }
+    val slowMo = modes.slowMo
 
-    var selectedConfig by remember {
-        mutableStateOf(
-            supportedConfigs.firstOrNull { it.fps == 60 && it.resolution.width >= 3840 }
-                ?: supportedConfigs.firstOrNull { it.fps == 60 }
-                ?: supportedConfigs.firstOrNull()
-                ?: VideoConfig(
-            id = "default",
-            resolution = android.util.Size(1920, 1080),
-            fps = 30,
-            bitrate = 14_000_000,
-            label = "1080p FHD (1920x1080)"
-        ))
-    }
+    var selectedId by remember { mutableStateOf(modes.uhd60.id) }
+    val selectedConfig = if (slowMo != null && selectedId == slowMo.id) slowMo else modes.uhd60
 
     var orientationMode by remember { mutableIntStateOf(1) } // 0 portrait, 1 landscape, 2 landscape flipped
+
     var canOverlay by remember { mutableStateOf(AndroidSettings.canDrawOverlays(context)) }
     DisposableEffect(Unit) {
         val lifecycle = (context as? ComponentActivity)?.lifecycle
@@ -74,30 +81,28 @@ fun CameraScreen(
         lifecycle?.addObserver(observer)
         onDispose { lifecycle?.removeObserver(observer) }
     }
-    var showConfigDialog by remember { mutableStateOf(false) }
 
     val service = getService()
     val stateFlow = remember(service) {
         service?.recordingState ?: MutableStateFlow(VideoRecordingService.RecordingState())
     }
     val recordingState by stateFlow.collectAsState()
+    val busy = recordingState.isRecording || recordingState.isStarting
 
-    // Single toggle used by both the on-screen button and the volume buttons
+    // One toggle used by the on-screen button and by the volume buttons
     val toggleRecording = rememberUpdatedState<() -> Unit> {
-        val activeService = getService()
-        if (activeService != null) {
-            if (activeService.recordingState.value.isRecording) {
-                activeService.stopRecording()
-            } else {
-                val ok = activeService.startRecording(
-                    config = selectedConfig,
-                    cameraManager = camera2Manager,
-                    cameraId = cameraId,
-                    previewSurface = null,
-                    orientationMode = orientationMode
-                )
-                if (!ok) {
-                    Toast.makeText(context, "فشل بدء التسجيل - جرّب إعداداً آخر", Toast.LENGTH_LONG).show()
+        val s = getService()
+        if (s == null) {
+            Toast.makeText(context, "الخدمة لسه بتجهز، جرّب تاني", Toast.LENGTH_SHORT).show()
+        } else {
+            val st = s.recordingState.value
+            if (st.isRecording) {
+                s.stopRecording()
+            } else if (!st.isStarting) {
+                s.startRecording(selectedConfig, cameraId, orientationMode) { ok, msg ->
+                    if (!ok) {
+                        Toast.makeText(context, "فشل بدء التسجيل: ${msg ?: ""}", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
         }
@@ -107,16 +112,9 @@ fun CameraScreen(
         onDispose { VolumeKeyController.onVolumeKey = null }
     }
 
-    LaunchedEffect(cameraId) {
-        try {
-            camera2Manager.openCamera(cameraId)
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        // 2. Top Header Overlay (Config badge, HEVC indicator, Lockscreen reminder)
+
+        // Top: the two modes + options
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -125,60 +123,49 @@ fun CameraScreen(
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // Resolution & FPS selector button
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = Color.Black.copy(alpha = 0.65f),
-                    modifier = Modifier.clickable(enabled = !recordingState.isRecording) {
-                        showConfigDialog = true
-                    }
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Settings,
-                            contentDescription = "Resolution/FPS",
-                            tint = Color.White,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "${selectedConfig.label} • ${selectedConfig.fps} FPS",
-                            color = Color.White,
-                            fontSize = 13.sp
-                        )
-                    }
-                }
-
-                // HEVC Codec Badge
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = Color(0xFF10B981).copy(alpha = 0.25f),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF10B981))
-                ) {
-                    Text(
-                        text = "HEVC / H.265",
-                        color = Color(0xFF10B981),
-                        fontSize = 11.sp,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                ModeCard(
+                    title = modes.uhd60.label,
+                    subtitle = "${modes.uhd60.codecName} • ${modes.uhd60.formattedBitrate}",
+                    selected = selectedConfig.id == modes.uhd60.id,
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f),
+                    onClick = { selectedId = modes.uhd60.id }
+                )
+                if (slowMo != null) {
+                    ModeCard(
+                        title = slowMo.label,
+                        subtitle = "${slowMo.codecName} • ${slowMo.formattedBitrate} • بدون صوت",
+                        selected = selectedConfig.id == slowMo.id,
+                        enabled = !busy,
+                        modifier = Modifier.weight(1f),
+                        onClick = { selectedId = slowMo.id }
+                    )
+                } else {
+                    ModeCard(
+                        title = "Slow-Mo",
+                        subtitle = "الجهاز مش بيدعمه",
+                        selected = false,
+                        enabled = false,
+                        modifier = Modifier.weight(1f),
+                        onClick = {}
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(10.dp))
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Surface(
                     shape = RoundedCornerShape(12.dp),
                     color = Color.Black.copy(alpha = 0.65f),
-                    modifier = Modifier.clickable(enabled = !recordingState.isRecording) {
+                    border = BorderStroke(1.dp, Color(0x55FFFFFF)),
+                    modifier = Modifier.clickable(enabled = !busy) {
                         orientationMode = (orientationMode + 1) % 3
                     }
                 ) {
@@ -216,7 +203,15 @@ fun CameraScreen(
                 }
             }
 
-            // Screen-off background notice
+            if (canOverlay) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "المعاينة: اسحبها بصباع للتحريك • بصباعين أو من الدايرة اللي في الركن للتكبير والتصغير",
+                    color = Color(0xFF94A3B8),
+                    fontSize = 11.sp
+                )
+            }
+
             if (recordingState.isRecording) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Surface(
@@ -236,7 +231,7 @@ fun CameraScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Foreground Service & WakeLock active • Screen can turn off safely",
+                            text = "التسجيل شغال • تقدر تقفل الشاشة (زرار الصوت بيوقّف)",
                             color = Color(0xFFE2E8F0),
                             fontSize = 11.sp
                         )
@@ -245,7 +240,7 @@ fun CameraScreen(
             }
         }
 
-        // 3. Bottom Recording Controls
+        // Bottom: timer + record button
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -253,7 +248,6 @@ fun CameraScreen(
                 .align(Alignment.BottomCenter),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Elapsed Timer when recording
             if (recordingState.isRecording) {
                 val sec = (recordingState.elapsedMs / 1000) % 60
                 val min = (recordingState.elapsedMs / (1000 * 60)) % 60
@@ -276,16 +270,18 @@ fun CameraScreen(
                                 .background(Color.White)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = timeString,
-                            color = Color.White,
-                            fontSize = 16.sp
-                        )
+                        Text(text = timeString, color = Color.White, fontSize = 16.sp)
                     }
                 }
+            } else if (recordingState.isStarting) {
+                Text(
+                    text = "بيجهّز...",
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    modifier = Modifier.padding(bottom = 20.dp)
+                )
             }
 
-            // Record / Stop Button
             Box(
                 modifier = Modifier
                     .size(80.dp)
@@ -302,72 +298,39 @@ fun CameraScreen(
                 )
             }
         }
+    }
+}
 
-        // 4. Configuration Picker Dialog (Only displays verified supported combinations!)
-        if (showConfigDialog) {
-            AlertDialog(
-                onDismissRequest = { showConfigDialog = false },
-                title = { Text("StreamConfigurationMap Supported Profiles") },
-                text = {
-                    Column {
-                        Text(
-                            text = "Only resolutions and FPS verified directly on this device sensor are listed:",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        supportedConfigs.forEach { config ->
-                            val isSelected = config.id == selectedConfig.id
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 4.dp)
-                                    .clickable {
-                                        selectedConfig = config
-                                        showConfigDialog = false
-                                    }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(12.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Column {
-                                        Text(
-                                            text = config.label,
-                                            style = MaterialTheme.typography.bodyMedium
-                                        )
-                                        Text(
-                                            text = "${config.fps} FPS • ${config.formattedBitrate} • HEVC",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                    if (config.is4K && config.fps == 60) {
-                                        Surface(
-                                            shape = RoundedCornerShape(4.dp),
-                                            color = Color(0xFFF59E0B)
-                                        ) {
-                                            Text(
-                                                text = "4K 60FPS",
-                                                color = Color.Black,
-                                                fontSize = 10.sp,
-                                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = { showConfigDialog = false }) {
-                        Text("Close")
-                    }
-                }
+@Composable
+private fun ModeCard(
+    title: String,
+    subtitle: String,
+    selected: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val accent = Color(0xFF10B981)
+    val bg = if (selected) accent.copy(alpha = 0.25f) else Color.Black.copy(alpha = 0.65f)
+    val borderColor = if (selected) accent else Color(0x55FFFFFF)
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = bg,
+        border = BorderStroke(if (selected) 2.dp else 1.dp, borderColor),
+        modifier = modifier.clickable(enabled = enabled) { onClick() }
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            Text(
+                text = title,
+                color = if (enabled || selected) Color.White else Color(0xFF94A3B8),
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = subtitle,
+                color = Color(0xFFCBD5E1),
+                fontSize = 11.sp
             )
         }
     }
@@ -390,18 +353,18 @@ fun PermissionRequestView(onRequestAgain: () -> Unit) {
         )
         Spacer(modifier = Modifier.height(16.dp))
         Text(
-            text = "Permissions Required",
+            text = "محتاج صلاحيات",
             style = MaterialTheme.typography.headlineSmall
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "Cam2Vault requires Camera, Microphone, and Notification permissions to record HEVC video continuously with the screen turned off.",
+            text = "Cam2Vault محتاج صلاحية الكاميرا والميكروفون والإشعارات عشان يسجّل والشاشة مقفولة.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Spacer(modifier = Modifier.height(24.dp))
         Button(onClick = onRequestAgain) {
-            Text("Grant Permissions")
+            Text("إدّي الصلاحيات")
         }
     }
 }

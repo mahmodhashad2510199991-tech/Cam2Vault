@@ -2,7 +2,6 @@ package com.example.cam2vault.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.CamcorderProfile
@@ -10,18 +9,24 @@ import android.media.MediaCodecList
 import android.media.MediaRecorder
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.util.Log
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import com.example.cam2vault.data.RecordingModes
 import com.example.cam2vault.data.VideoConfig
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
- * Manages Camera2 hardware queries, StreamConfigurationMap checks,
- * and handles persistent capture sessions for background recording.
+ * Camera2 helper.
+ *
+ * - [queryModes] returns the two supported modes: 4K 60fps and 1080p slow-motion (240fps when the
+ *   phone exposes it through the constrained high-speed API).
+ * - The recording service owns an instance of this class for the whole recording, so recording does
+ *   not depend on the Activity staying alive.
  */
 class Camera2Manager(private val context: Context) {
 
@@ -30,9 +35,14 @@ class Camera2Manager(private val context: Context) {
 
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
+
+    /** Called on the main thread if the camera is taken away while recording (another app, error...). */
+    @Volatile
+    var onCameraLost: (() -> Unit)? = null
 
     init {
         startBackgroundThread()
@@ -45,110 +55,101 @@ class Camera2Manager(private val context: Context) {
         }
     }
 
-    /**
-     * Inspects StreamConfigurationMap on the target camera.
-     * Evaluates output sizes for MediaRecorder and available AE FPS ranges
-     * to strictly return ONLY valid hardware configurations.
-     */
-    fun querySupportedVideoConfigurations(cameraId: String): List<VideoConfig> {
-        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-        val map: StreamConfigurationMap = characteristics.get(
-            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
-        ) ?: return emptyList()
+    // ---------------------------------------------------------------------------------------------
+    // Modes
+    // ---------------------------------------------------------------------------------------------
 
-        // 1. Get all sizes officially supported for MediaRecorder surface
-        val mediaRecorderSizes = map.getOutputSizes(MediaRecorder::class.java) ?: emptyArray()
-
-        // 2. Query available AE FPS ranges (e.g. [30, 30], [60, 60], [15, 60])
-        val fpsRanges = characteristics.get(
-            CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
-        ) ?: emptyArray()
-
-        val maxAvailableFps = fpsRanges.maxOfOrNull { it.upper } ?: 30
-        val supports60FpsGlobally = fpsRanges.any { it.upper >= 60 }
-
-        // Also check High Speed video capabilities if supported by the sensor
-        val highSpeedSizes = map.highSpeedVideoSizes ?: emptyArray()
-        val highSpeedFpsRanges = map.highSpeedVideoFpsRanges ?: emptyArray()
-        val supportsHighSpeed60 = highSpeedFpsRanges.any { it.upper >= 60 }
-
-        Log.d(TAG, "Available MediaRecorder sizes: ${mediaRecorderSizes.map { "${it.width}x${it.height}" }}")
-        Log.d(TAG, "Max FPS reported: $maxAvailableFps, Supports 60FPS: $supports60FpsGlobally")
-
-        val supportedConfigs = mutableListOf<VideoConfig>()
-
-        // Desired standard video resolutions to test against hardware map
-        val candidateResolutions = listOf(
-            Size(3840, 2160) to "4K UHD (3840x2160)",
-            Size(1920, 1080) to "1080p FHD (1920x1080)",
-            Size(1280, 720) to "720p HD (1280x720)"
-        )
-
-        for ((size, label) in candidateResolutions) {
-            // Check if StreamConfigurationMap has this size for MediaRecorder
-            val isSizeSupported = mediaRecorderSizes.any {
-                it.width == size.width && it.height == size.height
-            }
-
-            if (isSizeSupported) {
-                // Standard 30 FPS HEVC (always verified if size is supported)
-                val bitrate30 = calculateHevcBitrate(size.width, size.height, 30)
-                supportedConfigs.add(
-                    VideoConfig(
-                        id = "${size.width}x${size.height}_30",
-                        resolution = size,
-                        fps = 30,
-                        bitrate = bitrate30,
-                        label = label,
-                        codec = "HEVC (H.265)",
-                        isHighSpeed = false
-                    )
-                )
-
-                // 60 FPS HEVC: verified per size using real hardware limits
-                val minDurationNs = try {
-                    map.getOutputMinFrameDuration(MediaRecorder::class.java, size)
-                } catch (e: Exception) { 0L }
-                val sizeMaxFps = if (minDurationNs > 0) (1_000_000_000.0 / minDurationNs).toInt() else 0
-                val profileFps = profileFrameRate(cameraId, size)
-                val encoderOk = hevcEncoderSupports(size.width, size.height, 60)
-                Log.d(TAG, "${size.width}x${size.height}: sizeMaxFps=$sizeMaxFps profileFps=$profileFps encoder60=$encoderOk")
-
-                val verified60 = sizeMaxFps >= 59 || profileFps >= 59 ||
-                        (size.width < 3840 && (supports60FpsGlobally || supportsHighSpeed60)) ||
-                        (size.width >= 3840 && highSpeedSizes.any { it.width == size.width && it.height == size.height })
-
-                val bitrate60 = calculateHevcBitrate(size.width, size.height, 60)
-                if (verified60 && (encoderOk || size.width < 3840)) {
-                    supportedConfigs.add(
-                        VideoConfig(
-                            id = "${size.width}x${size.height}_60",
-                            resolution = size,
-                            fps = 60,
-                            bitrate = bitrate60,
-                            label = label,
-                            codec = "HEVC (H.265)",
-                            isHighSpeed = false
-                        )
-                    )
-                } else if (size.width >= 3840) {
-                    // Not reported by the camera HAL: offer as experimental so it can be tried
-                    supportedConfigs.add(
-                        VideoConfig(
-                            id = "${size.width}x${size.height}_60",
-                            resolution = size,
-                            fps = 60,
-                            bitrate = bitrate60,
-                            label = "$label (تجريبي)",
-                            codec = "HEVC (H.265)",
-                            isHighSpeed = false
-                        )
-                    )
-                }
-            }
+    fun queryModes(cameraId: String): RecordingModes {
+        val map = try {
+            cameraManager.getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read stream map", e)
+            null
         }
+        return RecordingModes(
+            uhd60 = build4k60(cameraId, map),
+            slowMo = if (map != null) buildSlowMo(map) else null
+        )
+    }
 
-        return supportedConfigs
+    private fun build4k60(cameraId: String, map: StreamConfigurationMap?): VideoConfig {
+        val size = Size(3840, 2160)
+        var verified = false
+        if (map != null) {
+            val sizes = map.getOutputSizes(MediaRecorder::class.java) ?: emptyArray()
+            val sizeOk = sizes.any { it.width == size.width && it.height == size.height }
+            val minDurationNs = try {
+                map.getOutputMinFrameDuration(MediaRecorder::class.java, size)
+            } catch (e: Exception) {
+                0L
+            }
+            val sizeMaxFps = if (minDurationNs > 0) (1_000_000_000.0 / minDurationNs).toInt() else 0
+            verified = sizeOk && (sizeMaxFps >= 59 || profileFrameRate(cameraId, size) >= 59)
+            Log.d(TAG, "4K sizeOk=$sizeOk sizeMaxFps=$sizeMaxFps verified=$verified")
+        }
+        val hevc = chooseHevc(size.width, size.height, 60)
+        return VideoConfig(
+            id = "4k60",
+            resolution = size,
+            fps = 60,
+            bitrate = bitrateFor(size.width, size.height, 60, hevc),
+            label = if (verified) "4K • 60fps" else "4K • 60fps (تجريبي)",
+            useHevc = hevc,
+            isHighSpeed = false,
+            withAudio = true
+        )
+    }
+
+    /**
+     * Slow-motion: prefers 1920x1080 @ 240fps. If the phone does not offer that through the
+     * high-speed API, falls back to the best combination it does offer (the real numbers are shown in the UI).
+     */
+    private fun buildSlowMo(map: StreamConfigurationMap): VideoConfig? {
+        val sizes = try {
+            map.highSpeedVideoSizes
+        } catch (e: Exception) {
+            null
+        } ?: return null
+        if (sizes.isEmpty()) return null
+
+        val candidates = ArrayList<Pair<Size, Range<Int>>>()
+        for (s in sizes) {
+            val ranges = try {
+                map.getHighSpeedVideoFpsRangesFor(s)
+            } catch (e: Exception) {
+                null
+            } ?: continue
+            val maxUpper = ranges.maxOfOrNull { it.upper } ?: continue
+            val best = ranges.filter { it.upper == maxUpper }.maxByOrNull { it.lower } ?: continue
+            candidates.add(s to best)
+        }
+        if (candidates.isEmpty()) return null
+
+        val chosen =
+            candidates.firstOrNull { it.first.width == 1920 && it.first.height == 1080 && it.second.upper >= 240 }
+                ?: candidates.filter { it.second.upper >= 240 }
+                    .maxByOrNull { it.first.width * it.first.height }
+                ?: candidates.firstOrNull { it.first.width == 1920 && it.first.height == 1080 }
+                ?: candidates.maxByOrNull { it.second.upper * 100_000_000L + it.first.width * it.first.height }
+                ?: return null
+
+        val size = chosen.first
+        val range = chosen.second
+        val hevc = chooseHevc(size.width, size.height, range.upper)
+        Log.d(TAG, "SlowMo chosen: ${size.width}x${size.height} range=$range hevc=$hevc")
+        return VideoConfig(
+            id = "slowmo",
+            resolution = size,
+            fps = range.upper,
+            fpsMin = range.lower,
+            bitrate = bitrateFor(size.width, size.height, range.upper, hevc),
+            label = "Slow-Mo ${size.height}p • ${range.upper}fps",
+            useHevc = hevc,
+            isHighSpeed = true,
+            // Audio is not recorded in slow-motion (high-speed sessions often fail with a mic attached).
+            withAudio = false
+        )
     }
 
     private fun profileFrameRate(cameraId: String, size: Size): Int {
@@ -167,128 +168,223 @@ class Camera2Manager(private val context: Context) {
         }
     }
 
-    private fun hevcEncoderSupports(width: Int, height: Int, fps: Int): Boolean {
+    private fun encoderSupports(mime: String, width: Int, height: Int, fps: Int): Boolean {
         return try {
             MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { info ->
-                info.isEncoder && info.supportedTypes.any { it.equals("video/hevc", ignoreCase = true) } &&
-                        info.getCapabilitiesForType("video/hevc").videoCapabilities
-                            .areSizeAndRateSupported(width, height, fps.toDouble())
+                info.isEncoder &&
+                        info.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&
+                        try {
+                            info.getCapabilitiesForType(mime).videoCapabilities
+                                .areSizeAndRateSupported(width, height, fps.toDouble())
+                        } catch (e: Exception) {
+                            false
+                        }
             }
         } catch (e: Exception) {
             false
         }
     }
 
-    /**
-     * Efficient HEVC H.265 bitrate targeting (approx 40-50% savings over H.264).
-     */
-    private fun calculateHevcBitrate(width: Int, height: Int, fps: Int): Int {
-        return when {
-            width >= 3840 -> if (fps >= 60) 48_000_000 else 32_000_000  // 48 Mbps vs 32 Mbps
-            width >= 1920 -> if (fps >= 60) 20_000_000 else 12_000_000  // 20 Mbps vs 12 Mbps
-            else -> if (fps >= 60) 10_000_000 else 6_000_000            // 10 Mbps vs 6 Mbps
+    /** HEVC when the encoder can do it, otherwise H.264, otherwise HEVC anyway (let the recorder decide). */
+    private fun chooseHevc(width: Int, height: Int, fps: Int): Boolean {
+        if (encoderSupports("video/hevc", width, height, fps)) return true
+        if (encoderSupports("video/avc", width, height, fps)) return false
+        return true
+    }
+
+    private fun bitrateFor(width: Int, height: Int, fps: Int, hevc: Boolean): Int {
+        val bitsPerPixel = if (hevc) 0.08 else 0.12
+        val raw = (width.toDouble() * height * fps * bitsPerPixel).toLong()
+        return raw.coerceIn(8_000_000L, 80_000_000L).toInt()
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Camera + session
+    // ---------------------------------------------------------------------------------------------
+
+    @SuppressLint("MissingPermission")
+    suspend fun openCamera(cameraId: String): CameraDevice = suspendCancellableCoroutine { cont ->
+        try {
+            cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    if (cont.isActive) cont.resume(camera) else camera.close()
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    camera.close()
+                    cameraDevice = null
+                    if (cont.isActive) {
+                        cont.resumeWithException(RuntimeException("الكاميرا اتفصلت"))
+                    } else {
+                        mainHandler.post { onCameraLost?.invoke() }
+                    }
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    camera.close()
+                    cameraDevice = null
+                    if (cont.isActive) {
+                        cont.resumeWithException(RuntimeException("فشل فتح الكاميرا (كود $error)"))
+                    } else {
+                        mainHandler.post { onCameraLost?.invoke() }
+                    }
+                }
+            }, backgroundHandler)
+        } catch (e: Exception) {
+            if (cont.isActive) cont.resumeWithException(e)
         }
     }
 
     /**
-     * Opens the camera asynchronously using suspendCoroutine.
-     */
-    @SuppressLint("MissingPermission")
-    suspend fun openCamera(cameraId: String): CameraDevice = suspendCancellableCoroutine { cont ->
-        cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-            override fun onOpened(camera: CameraDevice) {
-                cameraDevice = camera
-                cont.resume(camera)
-            }
-
-            override fun onDisconnected(camera: CameraDevice) {
-                camera.close()
-                cameraDevice = null
-            }
-
-            override fun onError(camera: CameraDevice, error: Int) {
-                camera.close()
-                cameraDevice = null
-                cont.resumeWithException(RuntimeException("Camera open error: $error"))
-            }
-        }, backgroundHandler)
-    }
-
-    /**
-     * Configures a persistent CaptureSession containing the MediaRecorder surface
-     * and optional preview surface. Crucially, even if preview surface is detached
-     * (e.g. screen off / app minimized), the recording surface continues receiving frames!
+     * Starts the capture session. Normal session for 4K60, constrained high-speed session for slow-mo.
+     * [onReady] / [onError] are always delivered on the main thread.
      */
     fun startRecordingCaptureSession(
         cameraId: String,
         config: VideoConfig,
         recorderSurface: Surface,
-        previewSurface: Surface?
+        previewSurface: Surface?,
+        onReady: () -> Unit,
+        onError: (String) -> Unit
     ) {
-        val device = cameraDevice ?: run {
-            Log.e(TAG, "Cannot start recording session: CameraDevice is null")
+        val device = cameraDevice
+        if (device == null) {
+            mainHandler.post { onError("الكاميرا مش مفتوحة") }
             return
         }
 
-        // Close any previous session
-        captureSession?.close()
-
-        val surfaces = mutableListOf<Surface>(recorderSurface)
-        if (previewSurface != null && previewSurface.isValid) {
-            surfaces.add(previewSurface)
+        try {
+            captureSession?.close()
+        } catch (_: Exception) {
         }
+        captureSession = null
 
+        val surfaces = ArrayList<Surface>()
+        surfaces.add(recorderSurface)
+        if (previewSurface != null && previewSurface.isValid) surfaces.add(previewSurface)
+
+        try {
+            if (config.isHighSpeed) {
+                startHighSpeedSession(device, config, surfaces, onReady, onError)
+            } else {
+                startNormalSession(device, cameraId, config, surfaces, onReady, onError)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "createCaptureSession failed", e)
+            mainHandler.post { onError(e.message ?: "فشل إنشاء جلسة الكاميرا") }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun startNormalSession(
+        device: CameraDevice,
+        cameraId: String,
+        config: VideoConfig,
+        surfaces: List<Surface>,
+        onReady: () -> Unit,
+        onError: (String) -> Unit
+    ) {
         device.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 captureSession = session
                 try {
-                    val requestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                        addTarget(recorderSurface)
-                        if (previewSurface != null && previewSurface.isValid) {
-                            addTarget(previewSurface)
-                        }
+                    val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+                    val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                    for (s in surfaces) builder.addTarget(s)
 
-                        // Set continuous video autofocus
-                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                    builder.set(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                    )
 
-                        // Enforce exact FPS target range (e.g. [60, 60] or [30, 30])
-                        val aeRanges = cameraManager.getCameraCharacteristics(cameraId)
-                            .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
-                        val chosenRange = aeRanges.firstOrNull { it.lower == config.fps && it.upper == config.fps }
-                            ?: aeRanges.filter { it.upper == config.fps }.maxByOrNull { it.lower }
-                            ?: Range(config.fps, config.fps)
-                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, chosenRange)
+                    val aeRanges = characteristics
+                        .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                        ?: emptyArray()
+                    val chosenRange = aeRanges.firstOrNull { it.lower == config.fps && it.upper == config.fps }
+                        ?: aeRanges.filter { it.upper == config.fps }.maxByOrNull { it.lower }
+                        ?: Range(config.fps, config.fps)
+                    builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, chosenRange)
 
-                        // Enable optical video stabilization if hardware supports it
-                        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-                        val stabilizationModes = characteristics.get(
-                            CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES
+                    val stabilization = characteristics
+                        .get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+                    if (stabilization?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true) {
+                        builder.set(
+                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
                         )
-                        if (stabilizationModes?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true) {
-                            set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON)
-                        }
                     }
 
-                    session.setRepeatingRequest(requestBuilder.build(), null, backgroundHandler)
-                    Log.i(TAG, "CaptureSession configured with target FPS: ${config.fps}")
-
+                    session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+                    Log.i(TAG, "Normal session ready, fps range=$chosenRange")
+                    mainHandler.post { onReady() }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to start repeating record request", e)
+                    Log.e(TAG, "Failed to start repeating request", e)
+                    mainHandler.post { onError(e.message ?: "فشل بدء الكاميرا") }
                 }
             }
 
             override fun onConfigureFailed(session: CameraCaptureSession) {
-                Log.e(TAG, "Failed to configure CameraCaptureSession for recording")
+                Log.e(TAG, "Normal session configure failed")
+                mainHandler.post { onError("الجهاز مش بيدعم الإعداد ده (${config.label})") }
             }
         }, backgroundHandler)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun startHighSpeedSession(
+        device: CameraDevice,
+        config: VideoConfig,
+        surfaces: List<Surface>,
+        onReady: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        device.createConstrainedHighSpeedCaptureSession(
+            surfaces,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    captureSession = session
+                    try {
+                        val highSpeed = session as CameraConstrainedHighSpeedCaptureSession
+                        val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                        for (s in surfaces) builder.addTarget(s)
+                        builder.set(
+                            CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                            Range(config.fpsMin, config.fps)
+                        )
+                        builder.set(
+                            CaptureRequest.CONTROL_AF_MODE,
+                            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                        )
+                        val requests = highSpeed.createHighSpeedRequestList(builder.build())
+                        highSpeed.setRepeatingBurst(requests, null, backgroundHandler)
+                        Log.i(TAG, "High-speed session ready: ${config.fpsMin}-${config.fps}fps")
+                        mainHandler.post { onReady() }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to start high-speed burst", e)
+                        mainHandler.post { onError(e.message ?: "فشل بدء السلو موشن") }
+                    }
+                }
+
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    Log.e(TAG, "High-speed session configure failed")
+                    mainHandler.post { onError("الجهاز مش بيدعم السلو موشن (${config.label})") }
+                }
+            },
+            backgroundHandler
+        )
     }
 
     fun stopCaptureSession() {
         try {
             captureSession?.stopRepeating()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping repeating request", e)
+        }
+        try {
             captureSession?.close()
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping capture session", e)
+            Log.e(TAG, "Error closing capture session", e)
         }
         captureSession = null
     }
@@ -310,17 +406,23 @@ class Camera2Manager(private val context: Context) {
     }
 
     fun close() {
+        onCameraLost = null
         try {
             captureSession?.close()
-            captureSession = null
-            cameraDevice?.close()
-            cameraDevice = null
-            backgroundThread?.quitSafely()
-            backgroundThread = null
-            backgroundHandler = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing camera manager", e)
+        } catch (_: Exception) {
         }
+        captureSession = null
+        try {
+            cameraDevice?.close()
+        } catch (_: Exception) {
+        }
+        cameraDevice = null
+        try {
+            backgroundThread?.quitSafely()
+        } catch (_: Exception) {
+        }
+        backgroundThread = null
+        backgroundHandler = null
     }
 
     companion object {

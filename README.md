@@ -1,5 +1,7 @@
 # Cam2Vault — Native Android 14+ HEVC Background Video Recorder
 
+**Two modes only:** 4K @ 60fps, and Slow-Mo (1080p @ 240fps when the phone exposes it through the Camera2 high-speed API; otherwise the best high-speed combination the phone offers). The recording service owns the camera, so recording survives the app being closed. The floating preview can be dragged, pinch-resized, or resized from its corner handle.
+
 Cam2Vault is a production-grade native Android app in Kotlin implementing high-efficiency HEVC (H.265) video recording that continues flawlessly even when the user locks their screen or switches apps.
 
 ## Key Technical Architecture
