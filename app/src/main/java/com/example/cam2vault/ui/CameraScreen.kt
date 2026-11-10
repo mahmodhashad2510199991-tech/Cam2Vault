@@ -68,7 +68,7 @@ fun CameraScreen(
     var selectedId by remember { mutableStateOf(modes.uhd60.id) }
     val selectedConfig = if (slowMo != null && selectedId == slowMo.id) slowMo else modes.uhd60
 
-    var orientationMode by remember { mutableIntStateOf(1) } // 0 portrait, 1 landscape, 2 landscape flipped
+    val orientationMode = 0 // portrait only
 
     var canOverlay by remember { mutableStateOf(AndroidSettings.canDrawOverlays(context)) }
     DisposableEffect(Unit) {
@@ -161,25 +161,6 @@ fun CameraScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = Color.Black.copy(alpha = 0.65f),
-                    border = BorderStroke(1.dp, Color(0x55FFFFFF)),
-                    modifier = Modifier.clickable(enabled = !busy) {
-                        orientationMode = (orientationMode + 1) % 3
-                    }
-                ) {
-                    Text(
-                        text = when (orientationMode) {
-                            1 -> "عرضي 16:9"
-                            2 -> "عرضي مقلوب 16:9"
-                            else -> "طولي 9:16"
-                        },
-                        color = Color.White,
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                    )
-                }
                 if (!canOverlay) {
                     Surface(
                         shape = RoundedCornerShape(12.dp),

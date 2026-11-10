@@ -116,27 +116,53 @@ class VideoRecordingService : Service() {
         onResult: (Boolean, String?) -> Unit
     ) {
         val state = _recordingState.value
-        if (state.isRecording || state.isStarting) {
+        if (state.isRecording || state.isStarting || startJob?.isActive == true) {
             onResult(false, "التسجيل شغال بالفعل")
             return
         }
         _recordingState.value = RecordingState(isStarting = true, activeConfig = config)
 
         startJob = serviceScope.launch {
-            try {
-                doStart(config, cameraId, orientationMode)
-                onResult(true, null)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start recording: ${e.message}", e)
-                abortStart()
-                onResult(false, e.message ?: "فشل بدء التسجيل")
+            val errors = ArrayList<String>()
+            val attempts = buildAttempts(config)
+            for ((index, attempt) in attempts.withIndex()) {
+                if (index > 0) delay(500) // let the camera fully close before retrying
+                _recordingState.value = RecordingState(isStarting = true, activeConfig = attempt.first)
+                try {
+                    doStart(attempt.first, cameraId, orientationMode, attempt.second)
+                    onResult(true, null)
+                    return@launch
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Start attempt ${index + 1}/${attempts.size} failed: ${e.message}", e)
+                    errors.add(e.message ?: e.javaClass.simpleName)
+                    abortStart()
+                }
             }
+            onResult(false, errors.distinct().take(2).joinToString(" | ").ifEmpty { "فشل بدء التسجيل" })
         }
     }
 
-    private suspend fun doStart(config: VideoConfig, cameraId: String, orientationMode: Int) {
+    /**
+     * Slow-mo is fragile across phones, so it is tried in order:
+     * HEVC + preview -> H.264 + preview -> H.264 without preview. 4K60 is tried once.
+     */
+    private fun buildAttempts(config: VideoConfig): List<Pair<VideoConfig, Boolean>> {
+        if (!config.isHighSpeed) return listOf(config to true)
+        val list = ArrayList<Pair<VideoConfig, Boolean>>()
+        list.add(config to true)
+        val h264 = if (config.useHevc) {
+            config.copy(useHevc = false, bitrate = (config.bitrate * 3L / 2).coerceAtMost(80_000_000L).toInt())
+        } else {
+            config
+        }
+        if (config.useHevc) list.add(h264 to true)
+        list.add(h264 to false)
+        return list
+    }
+
+    private suspend fun doStart(config: VideoConfig, cameraId: String, orientationMode: Int, withPreview: Boolean) {
         val cam = Camera2Manager(applicationContext)
         activeCamera = cam
 
@@ -161,14 +187,14 @@ class VideoRecordingService : Service() {
 
         // 5. Optional floating preview
         var previewSurface: Surface? = null
-        if (Settings.canDrawOverlays(this)) {
+        if (withPreview && Settings.canDrawOverlays(this)) {
             val preview = FloatingPreview(this)
             floatingPreview = preview
             val bufferW = if (config.isHighSpeed) config.resolution.width else 1280
             val bufferH = if (config.isHighSpeed) config.resolution.height else 720
             previewSurface = withTimeoutOrNull(2500L) {
                 suspendCancellableCoroutine<Surface?> { c ->
-                    preview.show(bufferW, bufferH, hint) { s ->
+                    preview.show(bufferW, bufferH, orientationMode == 0) { s ->
                         if (c.isActive) c.resume(s)
                     }
                 }

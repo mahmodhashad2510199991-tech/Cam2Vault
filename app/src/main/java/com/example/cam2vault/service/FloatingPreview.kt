@@ -25,7 +25,6 @@ import kotlin.math.abs
  * - Drag with one finger to move it.
  * - Pinch with two fingers to make it bigger / smaller.
  * - Or drag the small handle in the bottom-right corner.
- * - The picture is rotated to match the video orientation (so it is always upright).
  */
 class FloatingPreview(private val context: Context) {
 
@@ -34,13 +33,13 @@ class FloatingPreview(private val context: Context) {
     private var texture: TextureView? = null
     private var params: WindowManager.LayoutParams? = null
 
-    private var rotation = 0
+    private var portrait = true
     private var longSidePx = 0f
 
     private fun dp(v: Int): Int = (v * context.resources.displayMetrics.density).toInt()
 
     private val isPortraitContent: Boolean
-        get() = rotation == 90 || rotation == 270
+        get() = portrait
 
     private fun widthFor(longSide: Float): Int =
         if (isPortraitContent) (longSide * 9f / 16f).toInt() else longSide.toInt()
@@ -65,39 +64,22 @@ class FloatingPreview(private val context: Context) {
             windowManager.updateViewLayout(view, p)
         } catch (_: Exception) {
         }
-        updateTransform(p.width, p.height)
-    }
-
-    /** Rotates the (stretched) camera buffer so the image is upright and not distorted. */
-    private fun updateTransform(vw: Int, vh: Int) {
-        val tv = texture ?: return
-        if (vw <= 0 || vh <= 0) return
-        val m = Matrix()
-        val cx = vw / 2f
-        val cy = vh / 2f
-        when (rotation) {
-            90, 270 -> {
-                m.postScale(vh.toFloat() / vw, vw.toFloat() / vh, cx, cy)
-                m.postRotate(rotation.toFloat(), cx, cy)
-            }
-            180 -> m.postRotate(180f, cx, cy)
-        }
-        tv.setTransform(m)
     }
 
     /**
      * @param bufferWidth / bufferHeight size of the camera buffer going into the preview surface
-     * @param rotationDegrees video orientation hint (0, 90, 180, 270)
+     * @param portrait true: tall 9:16 window. The camera pipeline already hands the TextureView an
+     *                 upright image for a portrait screen, so no extra rotation is applied.
      */
     @SuppressLint("ClickableViewAccessibility")
     fun show(
         bufferWidth: Int,
         bufferHeight: Int,
-        rotationDegrees: Int,
+        portrait: Boolean,
         onSurfaceReady: (Surface?) -> Unit
     ) {
         hide()
-        rotation = ((rotationDegrees % 360) + 360) % 360
+        this.portrait = portrait
         try {
             val tv = TextureView(context)
             texture = tv
@@ -126,7 +108,7 @@ class FloatingPreview(private val context: Context) {
             handleLp.setMargins(0, 0, dp(4), dp(4))
             container.addView(handle, handleLp)
 
-            longSidePx = dp(260).toFloat().coerceIn(minLongSide(), maxLongSide())
+            longSidePx = dp(220).toFloat().coerceIn(minLongSide(), maxLongSide())
 
             val lp = WindowManager.LayoutParams(
                 widthFor(longSidePx),
@@ -144,13 +126,10 @@ class FloatingPreview(private val context: Context) {
             tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
                     st.setDefaultBufferSize(bufferWidth, bufferHeight)
-                    updateTransform(width, height)
                     onSurfaceReady(Surface(st))
                 }
 
-                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
-                    updateTransform(width, height)
-                }
+                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
 
                 override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
 
